@@ -190,7 +190,10 @@ class MCPLogger:
             f"Filter Event: {event_type} - {len(redactions)} redactions"
         )
         for r in redactions:
-            self._logger.debug(f"  {r.get('pattern')}: '{r.get('matched')}' -> '{r.get('replacement')}'")
+            self._logger.debug(
+                f"  {r.get('pattern')}: {r.get('matched_len')} chars "
+                f"[{r.get('matched_hash')}] -> '{r.get('replacement')}'"
+            )
 
 
 # Global logger instance (lazy initialization)

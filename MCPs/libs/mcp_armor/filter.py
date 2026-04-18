@@ -5,12 +5,15 @@ Provides functions to filter sensitive data from strings, dicts, and lists.
 
 from __future__ import annotations
 
-import json
+import hashlib
 import re
 import logging
-from typing import Any, Union
+from typing import Any
 
-from .config import FilterConfig, FilterPattern
+try:
+    from .config import FilterConfig, FilterPattern
+except ImportError:
+    from config import FilterConfig, FilterPattern
 
 
 class ContentFilter:
@@ -31,49 +34,87 @@ class ContentFilter:
         for pattern in self.config.patterns:
             if pattern.enabled and pattern.pattern:
                 try:
-                    compiled = re.compile(pattern.pattern)
+                    compiled = re.compile(pattern.pattern, re.MULTILINE)
                     self._compiled_patterns.append((pattern, compiled))
                 except re.error as e:
                     logging.warning(f"Invalid regex pattern '{pattern.name}': {e}")
+
+        self._sensitive_key_patterns: list[re.Pattern] = []
+        for key_pattern in getattr(self.config, "sensitive_keys", []):
+            try:
+                self._sensitive_key_patterns.append(re.compile(key_pattern))
+            except re.error as e:
+                logging.warning(f"Invalid sensitive_keys regex '{key_pattern}': {e}")
+
+    def _is_sensitive_key(self, key: str) -> bool:
+        return any(rx.fullmatch(key) for rx in self._sensitive_key_patterns)
+
+    @staticmethod
+    def _hash_secret(value: str) -> str:
+        return hashlib.sha256(value.encode("utf-8")).hexdigest()[:8]
     
     def filter_string(self, text: str) -> tuple[str, list[dict]]:
         """Filter sensitive data from a string.
-        
+
+        If a pattern defines a named group ``(?P<secret>...)``, only that
+        span is redacted; the surrounding context (label, separator) is
+        preserved. Patterns without a ``secret`` group redact group 0.
+
         Args:
             text: The input string to filter.
-            
+
         Returns:
             Tuple of (filtered_text, list of redaction records).
         """
         if not text:
             return text, []
-        
-        redactions = []
-        result = text
-        
-        # First pass: find all matches using finditer to get full match objects
-        # We collect all matches first, then apply substitutions
-        matches_to_apply = []  # List of (start, end, replacement)
-        
+
+        # Collect candidate spans across all patterns.
+        # Each span: (start, end, replacement, pattern_name)
+        spans: list[tuple[int, int, str, str]] = []
         for pattern, compiled in self._compiled_patterns:
-            for match in compiled.finditer(result):
-                # match.group(0) is the full match (not just capture groups)
-                full_match = match.group(0)
-                redactions.append({
-                    "pattern": pattern.name,
-                    "matched": full_match,
-                    "replacement": pattern.replacement,
-                })
-                matches_to_apply.append((match.start(), match.end(), pattern.replacement))
-        
-        if not self.config.dry_run and matches_to_apply:
-            # Apply substitutions from end to start to preserve positions
-            # Sort by position descending
-            matches_to_apply.sort(key=lambda x: x[0], reverse=True)
-            
-            for start, end, replacement in matches_to_apply:
-                result = result[:start] + replacement + result[end:]
-        
+            for match in compiled.finditer(text):
+                groups = match.groupdict()
+                if "secret" in groups and groups["secret"]:
+                    start, end = match.start("secret"), match.end("secret")
+                else:
+                    start, end = match.start(), match.end()
+                spans.append((start, end, pattern.replacement, pattern.name))
+
+        if not spans:
+            return text, []
+
+        # Resolve overlaps: leftmost-first, ties broken by widest.
+        # Sort key: (start ascending, end descending). Python's sort is
+        # stable, so equal (start, end) preserves pattern scan order.
+        spans.sort(key=lambda s: (s[0], -s[1]))
+        kept: list[tuple[int, int, str, str]] = []
+        last_end = -1
+        for span in spans:
+            if span[0] >= last_end:
+                kept.append(span)
+                last_end = span[1]
+
+        # Build redaction records from kept spans only — no plaintext stored.
+        redactions = []
+        for start, end, replacement, name in kept:
+            secret_bytes = text[start:end].encode("utf-8")
+            redactions.append({
+                "pattern": name,
+                "span": (start, end),
+                "matched_len": end - start,
+                "matched_hash": hashlib.sha256(secret_bytes).hexdigest()[:8],
+                "replacement": replacement,
+            })
+
+        if self.config.dry_run:
+            return text, redactions
+
+        # Apply right-to-left so earlier indices stay valid.
+        result = text
+        for start, end, replacement, _ in reversed(kept):
+            result = result[:start] + replacement + result[end:]
+
         return result, redactions
     
     def filter_dict(
@@ -100,27 +141,36 @@ class ContentFilter:
         
         result = {}
         for key, value in data.items():
-            current_path = f"{_path}.{key}" if _path else key
-            
-            # Filter the key name itself
-            filtered_key, key_redactions = self.filter_string(key)
-            _redactions.extend(key_redactions)
-            
-            # Filter the value
-            if isinstance(value, str):
+            current_path = f"{_path}.{key}" if _path else str(key)
+            key_is_sensitive = isinstance(key, str) and self._is_sensitive_key(key)
+
+            if key_is_sensitive and isinstance(value, str):
+                # Whole-value redaction triggered by key name. Don't run text
+                # patterns on the value — that would let "harmless-looking"
+                # secrets through. The key told us this is a secret; trust it.
+                result[key] = "[REDACTED]"
+                _redactions.append({
+                    "pattern": "<sensitive_key>",
+                    "key": key,
+                    "path": current_path,
+                    "matched_len": len(value),
+                    "matched_hash": self._hash_secret(value),
+                    "replacement": "[REDACTED]",
+                })
+            elif isinstance(value, str):
                 filtered_value, value_redactions = self.filter_string(value)
                 _redactions.extend(value_redactions)
-                result[filtered_key] = filtered_value
+                result[key] = filtered_value
             elif isinstance(value, dict):
                 filtered_value, _ = self.filter_dict(value, current_path, _redactions)
-                result[filtered_key] = filtered_value
+                result[key] = filtered_value
             elif isinstance(value, list):
                 filtered_value, _ = self.filter_list(value, current_path, _redactions)
-                result[filtered_key] = filtered_value
+                result[key] = filtered_value
             else:
-                # For other types (int, float, bool, None), keep as-is
-                result[filtered_key] = value
-        
+                # int, float, bool, None — pass through.
+                result[key] = value
+
         return result, _redactions
     
     def filter_list(
@@ -164,46 +214,27 @@ class ContentFilter:
         
         return result, _redactions
     
-    def filter(
-        self, 
-        data: Any
-    ) -> tuple[Any, list[dict]]:
-        """Filter sensitive data from any supported data type.
-        
-        Supports: str, dict, list, and types that serialize to JSON.
-        
+    def filter(self, data: Any) -> tuple[Any, list[dict]]:
+        """Filter sensitive data from any supported type.
+
+        Strings are filtered as text. JSON-string detection was removed:
+        callers who want structural filtering of a JSON payload should
+        ``json.loads`` it themselves, filter the dict, then re-serialize.
+        The library does not guess.
+
         Args:
-            data: The data to filter (str, dict, list, or JSON-serializable).
-            
+            data: str, dict, or list. Other types pass through unchanged.
+
         Returns:
             Tuple of (filtered_data, list of redaction records).
         """
         if isinstance(data, str):
-            # Try to parse as JSON first
-            try:
-                parsed = json.loads(data)
-                filtered, redactions = self._filter_any(parsed)
-                return json.dumps(filtered, indent=2, default=str), redactions
-            except (json.JSONDecodeError, TypeError):
-                # Not valid JSON, treat as plain string
-                return self.filter_string(data)
-        
-        return self._filter_any(data)
-    
-    def _filter_any(self, data: Any) -> tuple[Any, list[dict]]:
-        """Internal helper to filter any supported type."""
-        redactions = []
-        
+            return self.filter_string(data)
         if isinstance(data, dict):
-            filtered, redactions = self.filter_dict(data)
-        elif isinstance(data, list):
-            filtered, redactions = self.filter_list(data)
-        elif isinstance(data, str):
-            filtered, redactions = self.filter_string(data)
-        else:
-            filtered = data
-        
-        return filtered, redactions
+            return self.filter_dict(data)
+        if isinstance(data, list):
+            return self.filter_list(data)
+        return data, []
 
 
 def filter_content(
@@ -227,4 +258,7 @@ def filter_content(
 
 
 # Import this at module level to avoid circular import
-from .config import load_default_config
+try:
+    from .config import load_default_config
+except ImportError:
+    from config import load_default_config
